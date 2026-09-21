@@ -44,54 +44,73 @@ def signal(closes, cfg):
     return sum(closes[-cfg.fast:])/cfg.fast > sum(closes[-cfg.slow:])/cfg.slow and rsi < 70
 
 
-def simulate(rows, cfg):
-    cfg.validate()
-    if len(rows) < cfg.slow + 2:
-        raise ValueError('No hay suficientes velas para las medias elegidas.')
-    previous = -1
+def validate_rows(rows, previous=-1):
     for row in rows:
         if not all(math.isfinite(row[k]) and row[k] > 0 for k in ('time','open','close')) or row['time'] <= previous:
             raise ValueError('Velas inválidas o desordenadas.')
         previous = row['time']
-    cash, units, peak = cfg.capital, 0., cfg.capital
+
+
+def new_state(cfg):
+    return dict(cash=cfg.capital, units=0., peak=cfg.capital, halted=False,
+                pending_halt=False, desired=False, fees=0., worst=0.)
+
+
+def step(state, row, cfg, history):
+    """Process one candle. Mutates state and history (closes up to and including this candle).
+
+    A signal at close t can only execute at open t+1. Returns (equity, trade or None).
+    """
+    if state['pending_halt']:
+        state['halted'] = True
+    halted = state['halted']
+    reason = 'Límite de caída' if halted else 'Señal'
+    trade = None
+    if state['units'] and (not state['desired'] or halted):
+        price = row['open'] * (1-cfg.slippage)
+        quantity = state['units']
+        fee = quantity * price * cfg.fee
+        state['cash'] += quantity * price - fee
+        state['units'] = 0.
+        trade = dict(time=row['time'], side='VENTA', price=price, quantity=quantity, fee=fee, reason=reason)
+    elif state['desired'] and not state['units'] and not halted:
+        budget = state['cash'] * cfg.exposure
+        price = row['open'] * (1+cfg.slippage)
+        quantity = budget / (price * (1+cfg.fee))
+        fee = quantity * price * cfg.fee
+        state['cash'] -= budget
+        state['units'] = quantity
+        trade = dict(time=row['time'], side='COMPRA', price=price, quantity=quantity, fee=fee, reason=reason)
+    if trade:
+        state['fees'] += trade['fee']
+    # Equity is estimated net liquidation value, including hypothetical exit costs.
+    equity = state['cash'] + state['units'] * row['close'] * (1-cfg.slippage) * (1-cfg.fee)
+    state['peak'] = max(state['peak'], equity)
+    dd = 1-equity/state['peak']
+    state['worst'] = max(state['worst'], dd)
+    if dd >= cfg.max_drawdown:
+        state['pending_halt'] = True
+    history.append(row['close'])
+    state['desired'] = signal(history, cfg)
+    return equity, trade
+
+
+def simulate(rows, cfg):
+    cfg.validate()
+    if len(rows) < cfg.slow + 2:
+        raise ValueError('No hay suficientes velas para las medias elegidas.')
+    validate_rows(rows)
+    state = new_state(cfg)
     history, trades, curve = [], [], []
-    halted, pending_halt, desired = False, False, False
-    fees, worst = 0., 0.
     start = max(cfg.slow, 15)
     benchmark_units = cfg.capital / (rows[start]['open'] * (1+cfg.slippage) * (1+cfg.fee))
     for i, row in enumerate(rows):
-        # A signal at close t can only execute at open t+1.
-        if pending_halt:
-            halted = True
-        reason = 'Límite de caída' if halted else 'Señal'
-        side = None
-        if units and (not desired or halted):
-            price = row['open'] * (1-cfg.slippage)
-            quantity = units
-            fee = quantity * price * cfg.fee
-            cash += quantity * price - fee
-            units, side = 0., 'VENTA'
-        elif desired and not units and not halted:
-            budget = cash * cfg.exposure
-            price = row['open'] * (1+cfg.slippage)
-            quantity = budget / (price * (1+cfg.fee))
-            fee = quantity * price * cfg.fee
-            cash -= budget
-            units, side = quantity, 'COMPRA'
-        if side:
-            fees += fee
-            trades.append(dict(time=row['time'], side=side, price=price, quantity=quantity, fee=fee, reason=reason))
-        # Equity is estimated net liquidation value, including hypothetical exit costs.
-        equity = cash + units * row['close'] * (1-cfg.slippage) * (1-cfg.fee)
-        peak = max(peak, equity)
-        dd = 1-equity/peak
-        worst = max(worst, dd)
-        if dd >= cfg.max_drawdown:
-            pending_halt = True
+        equity, trade = step(state, row, cfg, history)
+        if trade:
+            trades.append(trade)
         benchmark = cfg.capital if i < start else benchmark_units * row['close'] * (1-cfg.slippage) * (1-cfg.fee)
         curve.append(dict(time=row['time'], equity=equity, benchmark=benchmark, close=row['close']))
-        history.append(row['close'])
-        desired = signal(history, cfg)
-    return dict(config=asdict(cfg), curve=curve, trades=trades, cash=cash, units=units,
-                equity=equity, return_pct=(equity/cfg.capital-1)*100, drawdown_pct=worst*100,
-                fees=fees, halted=halted or pending_halt, benchmark_pct=(benchmark/cfg.capital-1)*100)
+    return dict(config=asdict(cfg), curve=curve, trades=trades, cash=state['cash'], units=state['units'],
+                equity=equity, return_pct=(equity/cfg.capital-1)*100, drawdown_pct=state['worst']*100,
+                fees=state['fees'], halted=state['halted'] or state['pending_halt'],
+                benchmark_pct=(benchmark/cfg.capital-1)*100)
