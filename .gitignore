@@ -3,5 +3,8 @@ __pycache__/
 .venv/
 .env
 .env.*
+!.env.example
 *-informe.json
 *.db
+reports/
+events.json
