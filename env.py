@@ -16,7 +16,7 @@ def load(path=ENV_FILE):
                 values[key.strip()] = value.strip().strip('"').strip("'")
     except OSError:
         pass
-    values.update({k: v for k, v in os.environ.items() if k in values or k.startswith(('ANTHROPIC_', 'TELEGRAM_', 'ADVISOR_'))})
+    values.update({k: v for k, v in os.environ.items() if k in values or k.startswith(('GEMINI_', 'TELEGRAM_', 'ADVISOR_'))})
     return values
 
 
